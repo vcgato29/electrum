@@ -17,7 +17,6 @@ from .ecc import der_sig_from_sig_string
 from .transaction import Transaction
 from .lnhtlc import HTLCStateMachine
 from .lnutil import Outpoint, calc_short_channel_id
-from .lnwatcher import LNChanCloseHandler
 from .i18n import _
 
 # hardcoded nodes
@@ -29,6 +28,7 @@ class LNWorker(PrintError):
 
     def __init__(self, wallet, network):
         self.wallet = wallet
+        self.sweep_address = wallet.get_receiving_address()
         self.network = network
         pk = wallet.storage.get('lightning_privkey')
         if pk is None:
@@ -42,7 +42,7 @@ class LNWorker(PrintError):
         self.channels = {x.channel_id: x for x in map(HTLCStateMachine, wallet.storage.get("channels", []))}
         self.invoices = wallet.storage.get('lightning_invoices', {})
         for chan_id, chan in self.channels.items():
-            self.network.lnwatcher.watch_channel(chan, self.on_channel_utxos)
+            self.network.lnwatcher.watch_channel(chan, self.sweep_address, self.on_channel_utxos)
         # TODO peers that we have channels with should also be added now
         # but we don't store their IP/port yet.. also what if it changes?
         # need to listen for node_announcements and save the new IP/port
@@ -106,8 +106,6 @@ class LNWorker(PrintError):
         outpoints = [Outpoint(x["tx_hash"], x["tx_pos"]) for x in utxos]
         if chan.funding_outpoint not in outpoints:
             chan.state = "CLOSED"
-            # FIXME is this properly GC-ed? (or too soon?)
-            LNChanCloseHandler(self.network, self.wallet, chan)
         elif chan.state == 'DISCONNECTED':
             if chan.node_id not in self.peers:
                 self.print_error("received channel_utxos for channel which does not have peer (errored?)")
@@ -150,7 +148,7 @@ class LNWorker(PrintError):
             self.print_error("Channel_establishment_flow returned None")
             return
         self.save_channel(openingchannel)
-        self.network.lnwatcher.watch_channel(openingchannel, self.on_channel_utxos)
+        self.network.lnwatcher.watch_channel(openingchannel, self.sweep_address, self.on_channel_utxos)
         self.on_channels_updated()
 
     def on_channels_updated(self):

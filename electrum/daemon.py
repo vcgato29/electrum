@@ -246,6 +246,8 @@ class Daemon(DaemonThread):
             return
         wallet = Wallet(storage)
         wallet.start_threads(self.network)
+        from .lnworker import LNWorker
+        wallet.lnworker = LNWorker(wallet, self.network)
         self.wallets[path] = wallet
         return wallet
 
