@@ -20,6 +20,7 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import asyncio
 import time
 import queue
 import os
@@ -204,7 +205,6 @@ class Network(util.DaemonThread):
         self.callback_lock = threading.Lock()
         self.pending_sends_lock = threading.Lock()
         self.recent_servers_lock = threading.RLock()       # <- re-entrant
-        self.subscribed_addresses_lock = threading.Lock()
         self.blockchains_lock = threading.Lock()
 
         self.pending_sends = []
@@ -226,7 +226,6 @@ class Network(util.DaemonThread):
         util.make_dir(dir_path)
 
         # subscriptions and requests
-        self.subscribed_addresses = set()  # note: needs self.subscribed_addresses_lock
         self.h2addr = {}
         # Requests from client we've not seen a response to
         self.unanswered_requests = {}
@@ -244,6 +243,9 @@ class Network(util.DaemonThread):
         self.socket_queue = queue.Queue()
         self.start_network(deserialize_server(self.default_server)[2],
                            deserialize_proxy(self.config.get('proxy')))
+        self.asyncio_loop = loop = asyncio.get_event_loop()
+        asyncio.set_event_loop(self.asyncio_loop) # must be called from main thread
+        self.futures = []
 
     def with_interface_lock(func):
         def func_wrapper(self, *args, **kwargs):
@@ -336,26 +338,6 @@ class Network(util.DaemonThread):
             self.print_error(interface.host, "-->", method, params, message_id)
         interface.queue_request(method, params, message_id)
         return message_id
-
-    @with_interface_lock
-    def send_subscriptions(self):
-        assert self.interface
-        self.print_error('sending subscriptions to', self.interface.server, len(self.unanswered_requests), len(self.subscribed_addresses))
-        self.sub_cache.clear()
-        # Resend unanswered requests
-        requests = self.unanswered_requests.values()
-        self.unanswered_requests = {}
-        for request in requests:
-            message_id = self.queue_request(request[0], request[1])
-            self.unanswered_requests[message_id] = request
-        self.queue_request('server.banner', [])
-        self.queue_request('server.donation_address', [])
-        self.queue_request('server.peers.subscribe', [])
-        self.request_fee_estimates()
-        self.queue_request('blockchain.relayfee', [])
-        with self.subscribed_addresses_lock:
-            for h in self.subscribed_addresses:
-                self.queue_request('blockchain.scripthash.subscribe', [h])
 
     def request_fee_estimates(self):
         from .simple_config import FEE_ETA_TARGETS
@@ -585,7 +567,6 @@ class Network(util.DaemonThread):
             # fixme: we don't want to close headers sub
             #self.close_interface(self.interface)
             self.interface = i
-            self.send_subscriptions()
             self.set_status('connected')
             self.notify('updated')
             self.notify('interfaces')
@@ -690,11 +671,6 @@ class Network(util.DaemonThread):
                 # Copy the request method and params to the response
                 response['method'] = method
                 response['params'] = params
-                # Only once we've received a response to an addr subscription
-                # add it to the list; avoids double-sends on reconnection
-                if method == 'blockchain.scripthash.subscribe':
-                    with self.subscribed_addresses_lock:
-                        self.subscribed_addresses.add(params[0])
             else:
                 if not response:  # Closed remotely / misbehaving
                     self.connection_down(interface.server)
@@ -1077,12 +1053,30 @@ class Network(util.DaemonThread):
 
     def run(self):
         self.init_headers_file()
+        def asyncioThread():
+            self.asyncio_loop.run_forever()
+        t = threading.Thread(target=asyncioThread)
+        t.start()
         while self.is_running():
             self.maintain_sockets()
             self.wait_on_sockets()
             self.maintain_requests()
             self.run_jobs()    # Synchronizer and Verifier
             self.process_pending_sends()
+            if not t.is_alive():
+                self.print_error("Stopping Electrum, asyncio thread died")
+                self.stop()
+        [f.cancel() for f in self.futures]
+        if self.asyncio_loop.is_running():
+            async def loopstop():
+                self.asyncio_loop.stop()
+            asyncio.run_coroutine_threadsafe(loopstop(), self.asyncio_loop)
+            while self.asyncio_loop.is_running():
+                time.sleep(0.1)
+        try:
+            self.asyncio_loop.close()
+        except:
+            pass
         self.stop_network()
         self.on_stop()
 
@@ -1218,21 +1212,6 @@ class Network(util.DaemonThread):
             x2['params'] = [addr]
             callback(x2)
         return cb2
-
-    def subscribe_to_addresses(self, addresses, callback):
-        hash2address = {
-            bitcoin.address_to_scripthash(address): address
-            for address in addresses}
-        self.h2addr.update(hash2address)
-        msgs = [
-            ('blockchain.scripthash.subscribe', [x])
-            for x in hash2address.keys()]
-        self.send(msgs, self.map_scripthash_to_address(callback))
-
-    def request_address_history(self, address, callback):
-        h = bitcoin.address_to_scripthash(address)
-        self.h2addr.update({h: address})
-        self.send([('blockchain.scripthash.get_history', [h])], self.map_scripthash_to_address(callback))
 
     # NOTE this method handles exceptions and a special edge case, counter to
     # what the other ElectrumX methods do. This is unexpected.

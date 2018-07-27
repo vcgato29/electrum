@@ -29,7 +29,7 @@ from . import bitcoin
 from .bitcoin import COINBASE_MATURITY, TYPE_ADDRESS, TYPE_PUBKEY
 from .util import PrintError, profiler, bfh, VerifiedTxInfo, TxMinedStatus
 from .transaction import Transaction, TxOutput
-from .synchronizer import Synchronizer
+from .synchronizer import SynchronizerJob
 from .verifier import SPV
 from .blockchain import hash_header
 from .i18n import _
@@ -137,7 +137,7 @@ class AddressSynchronizer(PrintError):
         self.network = network
         if self.network is not None:
             self.verifier = SPV(self.network, self)
-            self.synchronizer = Synchronizer(self, network)
+            self.synchronizer = SynchronizerJob(self)
             network.add_jobs([self.verifier, self.synchronizer])
         else:
             self.verifier = None
@@ -146,7 +146,6 @@ class AddressSynchronizer(PrintError):
     def stop_threads(self):
         if self.network:
             self.network.remove_jobs([self.synchronizer, self.verifier])
-            self.synchronizer.release()
             self.synchronizer = None
             self.verifier = None
             # Now no references to the synchronizer or verifier
